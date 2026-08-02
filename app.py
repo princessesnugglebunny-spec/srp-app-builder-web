@@ -1,61 +1,88 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import gradio as gr
 import os
 import sys
+from pathlib import Path
 
-# Add core logic to path
-sys.path.append('/root/srp_app_builder')
-from orchestrator import SRPAppBuilder
+# Ensure core logic is in path
+sys.path.append(str(Path(__file__).parent / "srp_app_builder"))
 
-app = Flask(__name__)
-CORS(app)
+try:
+    from srp_app_builder.orchestrator import SRPAppBuilder
+except ImportError:
+    from orchestrator import SRPAppBuilder
 
 builder = SRPAppBuilder()
 
-@app.route('/api/ingest', methods=['POST'])
-def ingest():
-    data = request.json
-    repo_url = data.get('repo_url')
+def ingest_repo(repo_url):
     if not repo_url:
-        return jsonify({'error': 'repo_url is required'}), 400
+        return "❌ Please provide a URL", [], gr.update(choices=[])
     try:
-        builder.process_repository(repo_url)
-        return jsonify({'status': 'success', 'message': f'Repository {repo_url} ingested and indexed.'})
+        builder.ingest_repository(repo_url)
+        results = builder.store.search("") 
+        fragments = [f"{r[0]}: {r[1]} - {r[2]}" for r in results]
+        return f"✅ Successfully indexed {len(fragments)} fragments!", fragments, gr.update(choices=fragments)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return f"❌ Error: {str(e)}", [], gr.update(choices=[])
 
-@app.route('/api/search', methods=['GET'])
-def search():
-    query = request.args.get('q', '')
+def assemble_app(selected_fragments, prompt):
+    if not selected_fragments:
+        return "❌ Please select at least one component"
     try:
-        results = builder.store.search_fragments(query)
-        # Format results for React
-        formatted = [{'id': r[0], 'name': r[1], 'description': r[2], 'code': r[3]} for r in results]
-        return jsonify(formatted)
+        ids = [int(f.split(":")[0]) for f in selected_fragments]
+        app_path = builder.generator.create_app_package(ids, prompt)
+        return f"✅ App assembled at: {app_path}. Ready for APK deployment!"
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return f"❌ Error: {str(e)}"
 
-@app.route('/api/assemble', methods=['POST'])
-def assemble():
-    data = request.json
-    fragment_ids = data.get('fragment_ids', [])
-    description = data.get('description', '')
-    if not fragment_ids:
-        return jsonify({'error': 'fragment_ids are required'}), 400
+def deploy_apk(selected_fragments, prompt):
+    if not selected_fragments:
+        return "❌ Please select components first"
     try:
-        # This calls the AI generator and creates the local folder
-        app_path = builder.assemble_app(fragment_ids, description)
-        return jsonify({'status': 'success', 'path': app_path})
+        ids = [int(f.split(":")[0]) for f in selected_fragments]
+        builder.generator.create_app_package(ids, prompt)
+        return "🚀 Deployment triggered! Your APK is being built in the cloud via GitHub Actions."
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return f"❌ Deployment Error: {str(e)}"
 
-@app.route('/api/deploy', methods=['POST'])
-def deploy():
-    data = request.json
-    try:
-        return jsonify({'status': 'success', 'message': 'Deployment triggered to GitHub Actions. APK is building.'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+with gr.Blocks(theme=gr.themes.Soft(), title="SRP App Builder") as demo:
+    gr.Markdown("# 🚀 SRP App Builder")
+    gr.Markdown("### Decompose GitHub Repos → Assemble Kivy Apps → Deploy APK")
+    
+    with gr.Tabs():
+        with gr.TabItem("1. Ingest"):
+            with gr.Row():
+                repo_input = gr.Textbox(label="GitHub Repository URL", placeholder="https://github.com/user/repo", scale=4)
+                ingest_btn = gr.Button("Index Repository", variant="primary", scale=1)
+            
+            ingest_status = gr.Textbox(label="Status", interactive=False)
+            fragments_output = gr.State([]) 
+            fragments_display = gr.JSON(label="Indexed Components")
+            
+            # We need to define the selector here so we can update it
+            # But the selector is in Tab 2. Gradio allows this.
+            
+        with gr.TabItem("2. Assemble & Deploy"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    comp_selector = gr.CheckboxGroup(label="Select Components", choices=[], interactive=True)
+                    prompt_input = gr.Textbox(label="App Description", placeholder="e.g. A weather app with a dark theme", lines=3)
+                    assemble_btn = gr.Button("Assemble Package", variant="secondary")
+                
+                with gr.Column(scale=1):
+                    deploy_btn = gr.Button("🚀 Deploy to APK", variant="primary")
+                    deploy_status = gr.Textbox(label="Deployment Status", interactive=False)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # The magic link: Ingest button updates status, state, AND the selector in Tab 2
+    ingest_btn.click(
+        ingest_repo, 
+        inputs=[repo_input], 
+        outputs=[ingest_status, fragments_output, comp_selector]
+    ).then(
+        lambda x: x, inputs=[fragments_output], outputs=[fragments_display]
+    )
+
+    assemble_btn.click(assemble_app, inputs=[comp_selector, prompt_input], outputs=[deploy_status])
+    deploy_btn.click(deploy_apk, inputs=[comp_selector, prompt_input], outputs=[deploy_status])
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860)
